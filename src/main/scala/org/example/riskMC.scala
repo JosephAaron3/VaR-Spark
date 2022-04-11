@@ -20,25 +20,26 @@ object riskMC {
             */
         val start = LocalDate.of(2009, 10, 23)
         val end = LocalDate.of(2014, 10, 23)
+        val stocksDir = "src/main/resources/stocks/"
+        val factorsDir = "src/main/resources/factors/"
 
         // Load data
-        val stocksDir = new File("src/main/resources/stocks")
-        val files = stocksDir.listFiles()
-        val allStocks = files.iterator.flatMap { file =>
+        val stocksPath = new File(stocksDir)
+        val stocksFiles = stocksPath.listFiles()
+        val rawStocks = stocksFiles.iterator.flatMap { file =>
             try{
                 Some(readHistory(file))
             } catch {
                 case e: Exception => None
             }
         }
-        val factorsPrefix = "src/main/resources/factors/"
         val rawFactors = Array("NYSEARCA%3AGLD.csv", "NASDAQ%3ATLT.csv", "NYSEARCA%3ACRED.csv").
-                map(x => new File(factorsPrefix + x)).
+                map(x => new File(factorsDir + x)).
                 map(readHistory)
 
         // Preprocessing
-        val rawStocks = allStocks.filter(_.size >= 260 * 5 + 10)
-        val stocks = rawStocks.map(trim(_, start, end)).map(impute(_, start, end))
+        val rawStocksFiltered = rawStocks.filter(_.size >= 260 * 5 + 10)
+        val stocks = rawStocksFiltered.map(trim(_, start, end)).map(impute(_, start, end))
         val factors = rawFactors.map(trim(_, start, end)).map(impute(_, start, end))
         val T = stocks.next.length
         println((stocks ++ factors).forall(_.size == T)) //Check all histories are equal length
