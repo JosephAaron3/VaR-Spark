@@ -39,10 +39,14 @@ object riskMC {
 
         // Preprocessing
         val rawStocksFiltered = rawStocks.filter(_.size >= 260 * 5 + 10)
-        val stocks = rawStocksFiltered.map(trim(_, start, end)).map(impute(_, start, end))
-        val factors = rawFactors.map(trim(_, start, end)).map(impute(_, start, end))
-        val T = stocks.next.length
-        println((stocks ++ factors).forall(_.size == T)) //Check all histories are equal length
+        val stocks = rawStocksFiltered.map(trim(_, start, end))
+                .map(impute(_, start, end))
+        val factors = rawFactors.map(trim(_, start, end))
+                .map(impute(_, start, end))
+        val stocksReturns = stocks.map(twoWeekReturns).toArray.toSeq
+        val factorsReturns = factors.map(twoWeekReturns)
+        val factorMat = transposeFactors(factorsReturns)
+        val factorFeatures = factorMat.map(featurize)
     }
 
     /**
@@ -93,5 +97,29 @@ object riskMC {
             }
         }
         filled.toArray
+    }
+
+    def twoWeekReturns(history: Array[(LocalDate, Double)]): Array[Double] = {
+        history.sliding(10).map { //10 day sliding window for price change
+            window =>
+                val next = window.last._2
+                val prev = window.head._2
+                (next - prev) / prev
+        }.toArray
+    }
+
+    def transposeFactors(histories: Seq[Array[Double]]): Array[Array[Double]] = {
+        val mat = new Array[Array[Double]](histories.head.length)
+        for (i <- histories.head.indices) {
+            mat(i) = histories.map(_(i)).toArray
+        }
+        mat
+    }
+
+    //TODO: Add better feature transforms
+    def featurize(factorReturns: Array[Double]): Array[Double] = {
+        val squaredReturns = factorReturns.map(x => math.signum(x) * x * x)
+        val sqrtReturns = factorReturns.map(x => math.signum(x) * math.sqrt(math.abs(x)))
+        squaredReturns ++ sqrtReturns ++ factorReturns
     }
 }
