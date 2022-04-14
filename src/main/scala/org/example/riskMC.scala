@@ -1,7 +1,5 @@
 package org.example
 
-import org.apache.spark.sql.SparkSession
-
 import java.time.LocalDate
 import java.time.format.{DateTimeFormatter, DateTimeFormatterBuilder}
 import java.io.File
@@ -10,18 +8,23 @@ import scala.collection.mutable.ArrayBuffer
 import scala.math.Ordered.orderingToOrdered
 import scala.math.Ordering.Implicits.infixOrderingOps
 import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression
-import org.apache.spark.mllib.stat.KernelDensity
 import org.apache.spark.util.StatCounter
 import breeze.plot._
+import org.apache.spark.mllib.stat.KernelDensity
+import org.apache.spark.sql.{Dataset, SparkSession}
+import org.apache.spark.sql.functions
+import org.apache.spark.sql.catalyst.plans.logical.Sample
 
 object riskMC {
-    def main(args:Array[String]): Unit ={
-        /*
-            val sc = SparkSession.builder()
-                    .master("local[2]")
-                    .appName("Test")
-                    .getOrCreate()
-            */
+    def main(args: Array[String]): Unit = {
+        // Set up Spark session and instantiate risk class
+        val spark = SparkSession.builder()
+                .master("local[1]")
+                .appName("Risk")
+                .getOrCreate()
+        val risk = new riskMC(spark)
+
+
         val start = LocalDate.of(2009, 10, 23)
         val end = LocalDate.of(2014, 10, 23)
         val stocksDir = "src/main/resources/stocks/"
@@ -31,29 +34,39 @@ object riskMC {
         val stocksPath = new File(stocksDir)
         val stocksFiles = stocksPath.listFiles()
         val rawStocks = stocksFiles.iterator.flatMap { file =>
-            try{
-                Some(readHistory(file))
+            try {
+                Some(risk.readHistory(file))
             } catch {
                 case e: Exception => None
             }
         }
         val rawFactors = Array("NYSEARCA%3AGLD.csv", "NASDAQ%3ATLT.csv", "NYSEARCA%3ACRED.csv").
                 map(x => new File(factorsDir + x)).
-                map(readHistory)
+                map(risk.readHistory)
 
         // Preprocessing
         val rawStocksFiltered = rawStocks.filter(_.size >= 260 * 5 + 10)
-        val stocks = rawStocksFiltered.map(trim(_, start, end))
-                .map(impute(_, start, end))
-        val factors = rawFactors.map(trim(_, start, end))
-                .map(impute(_, start, end))
-        val stocksReturns = stocks.map(twoWeekReturns).toArray.toSeq
-        val factorsReturns = factors.map(twoWeekReturns)
-        val factorMat = transposeFactors(factorsReturns)
-        val factorFeatures = factorMat.map(featurize)
-        val factorWeights = stocksReturns.map(lm(_, factorFeatures))
+        val stocks = rawStocksFiltered.map(risk.trim(_, start, end))
+                .map(risk.impute(_, start, end))
+        val factors = rawFactors.map(risk.trim(_, start, end))
+                .map(risk.impute(_, start, end))
+        val stocksReturns = stocks.map(risk.twoWeekReturns).toArray.toSeq
+        val factorsReturns = factors.map(risk.twoWeekReturns)
+        val factorMat = risk.transposeFactors(factorsReturns)
+        val factorFeatures = factorMat.map(risk.featurize)
+
+        //Fit LR models
+        val factorWeights = stocksReturns.map(risk.lm(_, factorFeatures))
                 .map(_.estimateRegressionParameters()).toArray
+
+        //Plot returns
+        risk.plotDistribution(factorsReturns(1))
+        risk.plotDistribution(factorsReturns(2))
     }
+}
+
+class riskMC(private val spark: SparkSession) {
+    import spark.implicits._
 
     /**
      * Extract the date and price of a historic stock CSV
@@ -134,5 +147,21 @@ object riskMC {
         val regression = new OLSMultipleLinearRegression()
         regression.newSampleData(instrument, factorMatrix)
         regression
+    }
+
+    def plotDistribution(samples: Array[Double]): Figure = {
+        val min = samples.min
+        val max = samples.max
+        val sd = new StatCounter(samples).stdev
+        val bandwidth = 1.06 * sd * math.pow(samples.size, -0.2)
+        val domain = Range.BigDecimal(min, max, (max - min) / 100).map(_.toDouble).toList.toArray
+        val kd = new KernelDensity().setSample(samples.toSeq.toDS.rdd).setBandwidth(bandwidth)
+        val densities = kd.estimate(domain)
+        val f = Figure()
+        val p = f.subplot(0)
+        p += plot(domain, densities)
+        p.xlabel = "Two week return"
+        p.ylabel = "Density"
+        f
     }
 }
