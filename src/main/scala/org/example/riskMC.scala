@@ -9,6 +9,10 @@ import java.util.Locale
 import scala.collection.mutable.ArrayBuffer
 import scala.math.Ordered.orderingToOrdered
 import scala.math.Ordering.Implicits.infixOrderingOps
+import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression
+import org.apache.spark.mllib.stat.KernelDensity
+import org.apache.spark.util.StatCounter
+import breeze.plot._
 
 object riskMC {
     def main(args:Array[String]): Unit ={
@@ -47,6 +51,8 @@ object riskMC {
         val factorsReturns = factors.map(twoWeekReturns)
         val factorMat = transposeFactors(factorsReturns)
         val factorFeatures = factorMat.map(featurize)
+        val factorWeights = stocksReturns.map(lm(_, factorFeatures))
+                .map(_.estimateRegressionParameters()).toArray
     }
 
     /**
@@ -121,5 +127,12 @@ object riskMC {
         val squaredReturns = factorReturns.map(x => math.signum(x) * x * x)
         val sqrtReturns = factorReturns.map(x => math.signum(x) * math.sqrt(math.abs(x)))
         squaredReturns ++ sqrtReturns ++ factorReturns
+    }
+
+    def lm(instrument: Array[Double], factorMatrix: Array[Array[Double]]):
+    OLSMultipleLinearRegression = {
+        val regression = new OLSMultipleLinearRegression()
+        regression.newSampleData(instrument, factorMatrix)
+        regression
     }
 }
