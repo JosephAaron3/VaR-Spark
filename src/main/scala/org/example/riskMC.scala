@@ -14,6 +14,10 @@ import org.apache.spark.mllib.stat.KernelDensity
 import org.apache.spark.sql.{Dataset, SparkSession}
 import org.apache.spark.sql.functions
 import org.apache.spark.sql.catalyst.plans.logical.Sample
+import org.apache.commons.math3.stat.correlation.PearsonsCorrelation
+import org.apache.commons.math3.stat.correlation.Covariance
+import org.apache.commons.math3.distribution.MultivariateNormalDistribution
+import org.apache.commons.math3.random.MersenneTwister
 
 object riskMC {
     def main(args: Array[String]): Unit = {
@@ -62,6 +66,18 @@ object riskMC {
         //Plot returns
         risk.plotDistribution(factorsReturns(1))
         risk.plotDistribution(factorsReturns(2))
+
+        //Factor returns correlations
+        val factorCor = new PearsonsCorrelation(factorMat).getCorrelationMatrix.getData
+        println(factorCor.map(_.mkString("\t")).mkString("\n"))
+
+        //MC sampling
+        val trials = risk.computeSimulatedReturns(stocksReturns, factorsReturns,
+            3, 1000000, 1000)
+        trials.cache()
+
+        //Calculate 5% VaR (and CI)
+
     }
 }
 
@@ -163,5 +179,58 @@ class riskMC(private val spark: SparkSession) {
         p.xlabel = "Two week return"
         p.ylabel = "Density"
         f
+    }
+
+    def instrumentReturn(instrument: Array[Double], trial: Array[Double]): Double = {
+        var totalReturn = instrument(0)
+        var i = 0
+
+        while (i < trial.length) {
+            totalReturn += trial(i) * instrument(i + 1) //+1 due to intercept in instrument
+            i += 1
+        }
+        totalReturn
+    }
+
+    def trialReturn(trial: Array[Double], instruments: Seq[Array[Double]]): Double = {
+        var totalReturn = 0.0
+
+        for (instrument <- instruments) {
+            totalReturn += instrumentReturn(instrument, trial)
+        }
+        totalReturn / instruments.size
+    }
+
+    def allReturnsMCS(seed: Long, numTrials: Int, instruments: Seq[Array[Double]],
+                      factorMeans: Array[Double], factorCov: Array[Array[Double]]): Seq[Double] = {
+        val rand = new MersenneTwister() //Should be good enough here
+        val mvn = new MultivariateNormalDistribution(rand, factorMeans, factorCov)
+        val allReturns = new Array[Double](numTrials)
+
+        for (i <- 0 until numTrials) {
+            val trialFactorReturns = mvn.sample()
+            val trialFeatures = featurize(trialFactorReturns)
+            allReturns(i) = trialReturn(trialFeatures, instruments)
+        }
+        allReturns
+    }
+
+    //TODO: Possibly just move this to main function
+    def computeSimulatedReturns(stocksReturns: Seq[Array[Double]],
+                                factorsReturns: Seq[Array[Double]],
+                                seed: Long,
+                                numTrials: Int,
+                                parallelism: Int): Dataset[Double] = {
+        val factorMat = transposeFactors(factorsReturns)
+        val factorCov = new Covariance(factorMat).getCovarianceMatrix.getData
+        val factorMeans = factorsReturns.map(factor => factor.sum / factor.size).toArray
+        val factorFeatures = factorMat.map(featurize)
+        val factorWeights = stocksReturns.map(lm(_, factorFeatures))
+                .map(_.estimateRegressionParameters()).toArray
+
+        val seeds = (seed until seed + parallelism)
+        val seedDS = seeds.toDS().repartition(parallelism)
+        seedDS.flatMap(allReturnsMCS(_, numTrials / parallelism,
+            factorWeights, factorMeans, factorCov))
     }
 }
