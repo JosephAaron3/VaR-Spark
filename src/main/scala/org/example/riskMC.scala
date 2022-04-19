@@ -1,29 +1,25 @@
 package org.example
 
-import java.time.LocalDate
-import java.time.format.{DateTimeFormatter, DateTimeFormatterBuilder}
-import java.io.File
-import java.util.Locale
-import scala.collection.mutable.ArrayBuffer
-import scala.math.Ordered.orderingToOrdered
-import scala.math.Ordering.Implicits.infixOrderingOps
-import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression
-import org.apache.spark.util.StatCounter
 import breeze.plot._
-import org.apache.spark.mllib.stat.KernelDensity
-import org.apache.spark.sql.{Dataset, SparkSession}
-import org.apache.spark.sql.functions
-import org.apache.spark.sql.catalyst.plans.logical.Sample
-import org.apache.commons.math3.stat.correlation.PearsonsCorrelation
-import org.apache.commons.math3.stat.correlation.Covariance
 import org.apache.commons.math3.distribution.MultivariateNormalDistribution
 import org.apache.commons.math3.random.MersenneTwister
+import org.apache.commons.math3.stat.correlation.{Covariance, PearsonsCorrelation}
+import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression
+import org.apache.spark.mllib.stat.KernelDensity
+import org.apache.spark.sql.{Dataset, SparkSession}
+import org.apache.spark.util.StatCounter
+
+import java.io.File
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+import scala.collection.mutable.ArrayBuffer
 
 object riskMC {
     def main(args: Array[String]): Unit = {
         // Set up Spark session and instantiate risk class
         val spark = SparkSession.builder()
-                .master("local[1]")
+                .master("local[2]")
                 .appName("Risk")
                 .getOrCreate()
         val risk = new riskMC(spark)
@@ -55,33 +51,37 @@ object riskMC {
         val factors = rawFactors.map(risk.trim(_, start, end))
                 .map(risk.impute(_, start, end))
         val stocksReturns = stocks.map(risk.twoWeekReturns).toArray.toSeq
-        val factorsReturns = factors.map(risk.twoWeekReturns)
-        val factorMat = risk.transposeFactors(factorsReturns)
-        val factorFeatures = factorMat.map(risk.featurize)
-
-        //Fit LR models
-        val factorWeights = stocksReturns.map(risk.lm(_, factorFeatures))
-                .map(_.estimateRegressionParameters()).toArray
-
+        val factorsReturns = factors.map(risk.twoWeekReturns).toArray.toSeq
         //Plot returns
         risk.plotDistribution(factorsReturns(1))
         risk.plotDistribution(factorsReturns(2))
 
         //Factor returns correlations
+        val factorMat = risk.transposeFactors(factorsReturns)
         val factorCor = new PearsonsCorrelation(factorMat).getCorrelationMatrix.getData
         println(factorCor.map(_.mkString("\t")).mkString("\n"))
 
         //MC sampling
-        val trials = risk.computeSimulatedReturns(stocksReturns, factorsReturns,
-            3, 1000000, 1000)
+        val numTrials = 10
+        val parallelism = 1
+        val baseSeed = 1001L
+        val trials = risk.computeSimulatedReturns(stocksReturns, factorsReturns, baseSeed,
+            numTrials, parallelism)
+        trials.show(5)
         trials.cache()
 
-        //Calculate 5% VaR (and CI)
-
+        //Calculate 10% (c)VaR (and 95% CI)
+        val VaRPercent = 0.1
+        val VaR = risk.valueAtRisk(trials, VaRPercent)
+        val cVaR = risk.conditionalValueAtRisk(trials, VaRPercent)
+        val VaRCI = risk.bootstrappedCI(trials, risk.valueAtRisk, VaRPercent, 100, 0.95)
+        val cVaRCI = risk.bootstrappedCI(trials, risk.conditionalValueAtRisk, VaRPercent, 100, 0.95)
+        println("10% VaR = " + VaR + " (CI = " + VaRCI + ")")
+        println("10% cVaR = " + cVaR + " (CI = " + cVaRCI + ")")
     }
 }
 
-class riskMC(private val spark: SparkSession) {
+class riskMC(private val spark: SparkSession) extends java.io.Serializable {
     import spark.implicits._
 
     /**
@@ -182,14 +182,14 @@ class riskMC(private val spark: SparkSession) {
     }
 
     def instrumentReturn(instrument: Array[Double], trial: Array[Double]): Double = {
-        var totalReturn = instrument(0)
+        var instrumentReturn = instrument(0)
         var i = 0
 
         while (i < trial.length) {
-            totalReturn += trial(i) * instrument(i + 1) //+1 due to intercept in instrument
+            instrumentReturn += trial(i) * instrument(i + 1) //+1 due to intercept in instrument
             i += 1
         }
-        totalReturn
+        instrumentReturn
     }
 
     def trialReturn(trial: Array[Double], instruments: Seq[Array[Double]]): Double = {
@@ -203,19 +203,18 @@ class riskMC(private val spark: SparkSession) {
 
     def allReturnsMCS(seed: Long, numTrials: Int, instruments: Seq[Array[Double]],
                       factorMeans: Array[Double], factorCov: Array[Array[Double]]): Seq[Double] = {
-        val rand = new MersenneTwister() //Should be good enough here
+        val rand = new MersenneTwister(seed) //Should be good enough here
         val mvn = new MultivariateNormalDistribution(rand, factorMeans, factorCov)
-        val allReturns = new Array[Double](numTrials)
 
+        val allReturnsMCS = new Array[Double](numTrials)
         for (i <- 0 until numTrials) {
             val trialFactorReturns = mvn.sample()
             val trialFeatures = featurize(trialFactorReturns)
-            allReturns(i) = trialReturn(trialFeatures, instruments)
+            allReturnsMCS(i) = trialReturn(trialFeatures, instruments)
         }
-        allReturns
+        allReturnsMCS
     }
 
-    //TODO: Possibly just move this to main function
     def computeSimulatedReturns(stocksReturns: Seq[Array[Double]],
                                 factorsReturns: Seq[Array[Double]],
                                 seed: Long,
@@ -225,12 +224,41 @@ class riskMC(private val spark: SparkSession) {
         val factorCov = new Covariance(factorMat).getCovarianceMatrix.getData
         val factorMeans = factorsReturns.map(factor => factor.sum / factor.size).toArray
         val factorFeatures = factorMat.map(featurize)
-        val factorWeights = stocksReturns.map(lm(_, factorFeatures))
-                .map(_.estimateRegressionParameters()).toArray
+        val factorModels = stocksReturns.map(lm(_, factorFeatures))
+        val factorWeights = factorModels.map(_.estimateRegressionParameters()).toArray
 
         val seeds = (seed until seed + parallelism)
         val seedDS = seeds.toDS().repartition(parallelism)
         seedDS.flatMap(allReturnsMCS(_, numTrials / parallelism,
             factorWeights, factorMeans, factorCov))
+    }
+
+    def valueAtRisk(trials: Dataset[Double], percent: Double): Double = {
+        val quantiles = trials.stat.approxQuantile("value", Array(percent), 0.0)
+        quantiles.head //Best of worst 5% to get what we want
+    }
+
+    def conditionalValueAtRisk(trials: Dataset[Double], percent: Double): Double = {
+        val topLosses = trials.orderBy("value")
+                .limit(math.max(trials.count().toInt * percent, 1).toInt)
+        topLosses.agg("value" -> "avg").first()(0).asInstanceOf[Double] //Avg of worst 5%
+    }
+
+    def bootstrappedCI(trials: Dataset[Double],
+                       VaRFun: (Dataset[Double], Double) => Double,
+                       percent: Double,
+                       numResamples: Int,
+                       confLevel: Double): (Double, Double) = {
+
+        //Resample and compute function
+        val stats = (0 until numResamples).map { _ =>
+            val resample = trials.sample(withReplacement = true, 1.0)
+            VaRFun(resample, percent)
+        }.sorted
+
+        val lowerInd = (numResamples * (1 - confLevel) / 2 - 1).toInt
+        val upperInd = math.ceil(numResamples * (1 - (1 - confLevel) / 2)).toInt
+
+        (stats(lowerInd), stats(upperInd))
     }
 }
