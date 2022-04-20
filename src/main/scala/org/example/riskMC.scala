@@ -5,9 +5,10 @@ import org.apache.commons.math3.distribution.MultivariateNormalDistribution
 import org.apache.commons.math3.random.MersenneTwister
 import org.apache.commons.math3.stat.correlation.{Covariance, PearsonsCorrelation}
 import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.mllib.stat.KernelDensity
 import org.apache.spark.sql.{Dataset, SparkSession}
-import org.apache.spark.util.StatCounter
+import org.apache.spark.util.{SizeEstimator, StatCounter}
 
 import java.io.File
 import java.time.LocalDate
@@ -19,7 +20,7 @@ object riskMC {
     def main(args: Array[String]): Unit = {
         // Set up Spark session and instantiate risk class
         val spark = SparkSession.builder()
-                .master("local[2]")
+                .master("local[4]")
                 .appName("Risk")
                 .getOrCreate()
         val risk = new riskMC(spark)
@@ -62,12 +63,11 @@ object riskMC {
         println(factorCor.map(_.mkString("\t")).mkString("\n"))
 
         //MC sampling
-        val numTrials = 10
-        val parallelism = 1
+        val numTrials = 1000
+        val parallelism = 20
         val baseSeed = 1001L
         val trials = risk.computeSimulatedReturns(stocksReturns, factorsReturns, baseSeed,
             numTrials, parallelism)
-        trials.show(5)
         trials.cache()
 
         //Calculate 10% (c)VaR (and 95% CI)
@@ -192,16 +192,16 @@ class riskMC(private val spark: SparkSession) extends java.io.Serializable {
         instrumentReturn
     }
 
-    def trialReturn(trial: Array[Double], instruments: Seq[Array[Double]]): Double = {
+    def trialReturn(trial: Array[Double], instruments: Broadcast[Seq[Array[Double]]]): Double = {
         var totalReturn = 0.0
 
-        for (instrument <- instruments) {
+        for (instrument <- instruments.value) {
             totalReturn += instrumentReturn(instrument, trial)
         }
-        totalReturn / instruments.size
+        totalReturn / SizeEstimator.estimate(instruments)
     }
 
-    def allReturnsMCS(seed: Long, numTrials: Int, instruments: Seq[Array[Double]],
+    def allReturnsMCS(seed: Long, numTrials: Int, instruments: Broadcast[Seq[Array[Double]]],
                       factorMeans: Array[Double], factorCov: Array[Array[Double]]): Seq[Double] = {
         val rand = new MersenneTwister(seed) //Should be good enough here
         val mvn = new MultivariateNormalDistribution(rand, factorMeans, factorCov)
@@ -225,7 +225,7 @@ class riskMC(private val spark: SparkSession) extends java.io.Serializable {
         val factorMeans = factorsReturns.map(factor => factor.sum / factor.size).toArray
         val factorFeatures = factorMat.map(featurize)
         val factorModels = stocksReturns.map(lm(_, factorFeatures))
-        val factorWeights = factorModels.map(_.estimateRegressionParameters()).toArray
+        val factorWeights = spark.sparkContext.broadcast(factorModels.map(_.estimateRegressionParameters()))
 
         val seeds = (seed until seed + parallelism)
         val seedDS = seeds.toDS().repartition(parallelism)
