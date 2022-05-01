@@ -3,3 +3,5 @@
 .idea/*
 /src/main/resources/*
 target/*
+.env/
+data/*
